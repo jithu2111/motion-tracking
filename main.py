@@ -6,8 +6,10 @@ Outputs (written to ./output/):
     video2_sparse_optical_flow.mp4   — Lucas-Kanade sparse flow on video 2
     video1_dense_optical_flow.mp4    — Farneback dense flow (HSV) on video 1
     video2_dense_optical_flow.mp4    — Farneback dense flow (HSV) on video 2
-    frame_validation_video1.png      — Pixel-level tracking validation for video 1
-    frame_validation_video2.png      — Pixel-level tracking validation for video 2
+    flow_analysis_Video1_720p.png    — Quantitative evidence for optical flow inferences
+    flow_analysis_Video2_4K.png      — Quantitative evidence for optical flow inferences
+    frame_validation_Video1_720p.png — Pixel-level tracking cross-validation for video 1
+    frame_validation_Video2_4K.png   — Pixel-level tracking cross-validation for video 2
 """
 
 import cv2
@@ -291,16 +293,25 @@ def validate_tracking(video_path, label, out_png, scale=1.0):
     For a feature point tracked from frame t to t+1:
         predicted position:  p_hat = p + (u, v)
 
-    (u, v) comes from the LK solution described in Section 1.
+    Cross-validation approach
+    -------------------------
+    To avoid circular validation (where flow_uv = p1 - p0 trivially gives
+    p_hat = p1), we use TWO independent methods:
 
-    Validation procedure
-    --------------------
-    1. Detect feature corners in frame t   (Shi-Tomasi)
-    2. Run LK to get flow vectors (u, v)
-    3. Compute predicted position:  p_hat = p0 + (u, v)
-    4. Compare p_hat vs p1 (LK output)  — residual = ||p_hat - p1||
-    5. Use bilinear interpolation to read intensity at p_hat in frame t+1
-       and compare with actual intensity at the nearest integer pixel.
+      Method A — Lucas-Kanade (sparse):  gives tracked positions p1_LK
+      Method B — Farneback   (dense) :  gives flow field (u, v) at every pixel
+
+    We sample the dense Farneback flow at each feature location p0 to get
+    an independent (u_F, v_F), then predict:
+        p_hat = p0 + (u_F, v_F)
+
+    The residual ||p_hat - p1_LK|| measures how closely the two independent
+    methods agree.  A small residual validates that the tracking math is
+    consistent across different solvers.
+
+    We also compare intensities:
+        I_bilinear  = bilinear interpolation of frame t+1 at p_hat (sub-pixel)
+        I_actual    = frame t+1 at rounded p1_LK (integer pixel)
     """
     cap = cv2.VideoCapture(video_path)
     ret, frame0 = cap.read()
@@ -324,45 +335,63 @@ def validate_tracking(video_path, label, out_png, scale=1.0):
         print(f"  [!] No features found in {video_path}")
         return
 
-    # LK forward tracking: frame0 -> frame1
+    # Method A — LK sparse tracking: frame0 -> frame1
     p1, st, _ = cv2.calcOpticalFlowPyrLK(gray0, gray1, p0, None, **LK_PARAMS)
 
     good0 = p0[st == 1]   # shape (N, 2)
     good1 = p1[st == 1]
 
-    # Flow vectors
-    flow_uv = good1 - good0                    # (N, 2)
+    # Method B — Farneback dense flow (independent of LK)
+    dense_flow = cv2.calcOpticalFlowFarneback(
+        gray0, gray1, None,
+        pyr_scale=0.5, levels=3, winsize=15,
+        iterations=3, poly_n=5, poly_sigma=1.2, flags=0)
 
-    # Theoretical (predicted) position = p0 + (u, v)
-    predicted = good0 + flow_uv
+    # Sample dense flow at each feature point to get independent (u_F, v_F)
+    dense_uv = np.zeros_like(good0)
+    for idx in range(len(good0)):
+        xi = int(np.clip(round(good0[idx, 0]), 0, gray0.shape[1] - 1))
+        yi = int(np.clip(round(good0[idx, 1]), 0, gray0.shape[0] - 1))
+        dense_uv[idx, 0] = dense_flow[yi, xi, 0]   # u from Farneback
+        dense_uv[idx, 1] = dense_flow[yi, xi, 1]   # v from Farneback
+
+    # Predicted position using Farneback flow (independent of LK)
+    predicted = good0 + dense_uv
+
+    # LK flow for comparison in the table
+    lk_uv = good1 - good0
 
     N = min(len(good0), 10)   # show first 10 points in the table
     rows = []
     for i in range(N):
         x0_f, y0_f = good0[i]
-        x1_f, y1_f = good1[i]
-        u, v = flow_uv[i]
+        x1_f, y1_f = good1[i]              # LK result (ground truth)
+        u_f, v_f   = dense_uv[i]           # Farneback flow (independent)
 
-        x_pred, y_pred = x0_f + u, y0_f + v
+        x_pred, y_pred = x0_f + u_f, y0_f + v_f   # Farneback-predicted position
 
         # Intensity at predicted sub-pixel location via bilinear interpolation
         I_bilinear = bilinear_interpolate(gray1, x_pred, y_pred)
 
-        # Actual intensity at nearest integer pixel in frame1
+        # Actual intensity at nearest integer pixel in frame1 (at LK position)
         xi = int(np.clip(round(x1_f), 0, gray1.shape[1] - 1))
         yi = int(np.clip(round(y1_f), 0, gray1.shape[0] - 1))
         I_actual = int(gray1[yi, xi])
 
+        # Residual: distance between Farneback prediction and LK tracked position
         residual = np.sqrt((x_pred - x1_f)**2 + (y_pred - y1_f)**2)
         rows.append((i, x0_f, y0_f, x1_f, y1_f,
-                     x_pred, y_pred, u, v,
+                     x_pred, y_pred, u_f, v_f,
                      int(I_bilinear), I_actual, residual))
 
     # -----------------------------------------------------------------------
     # Plot: two frames + tracked points + validation table
     # -----------------------------------------------------------------------
     fig = plt.figure(figsize=(20, 14))
-    fig.suptitle(f"Tracking Validation — {label}", fontsize=14, fontweight="bold")
+    fig.suptitle(f"Tracking Validation — {label}\n"
+                 "Cross-validation: Farneback (dense) predicted positions vs "
+                 "Lucas-Kanade (sparse) tracked positions",
+                 fontsize=13, fontweight="bold")
 
     # Frame 0 with detected features
     ax0 = fig.add_subplot(2, 3, 1)
@@ -373,25 +402,26 @@ def validate_tracking(video_path, label, out_png, scale=1.0):
     ax0.legend(fontsize=7)
     ax0.axis("off")
 
-    # Frame 1 with tracked + predicted points
+    # Frame 1 with LK tracked + Farneback predicted points
     ax1 = fig.add_subplot(2, 3, 2)
     ax1.imshow(cv2.cvtColor(frame1, cv2.COLOR_BGR2RGB))
     ax1.scatter(good1[:, 0], good1[:, 1], s=20, c="red",
-                edgecolors="black", linewidths=0.5, label="Tracked LK (t+1)")
+                edgecolors="black", linewidths=0.5, label="LK tracked (t+1)")
     ax1.scatter(predicted[:, 0], predicted[:, 1], s=40,
-                marker="x", c="yellow", linewidths=1.5, label="Predicted p_hat")
-    ax1.set_title("Frame t+1 — LK Tracked vs Predicted")
+                marker="x", c="yellow", linewidths=1.5,
+                label="Farneback predicted p_hat")
+    ax1.set_title("Frame t+1 — LK Tracked vs Farneback Predicted")
     ax1.legend(fontsize=7)
     ax1.axis("off")
 
-    # Flow quiver plot
+    # Flow quiver plot (using Farneback flow)
     ax2 = fig.add_subplot(2, 3, 3)
     ax2.imshow(cv2.cvtColor(frame0, cv2.COLOR_BGR2RGB), alpha=0.6)
     step = max(1, len(good0) // 50)
     ax2.quiver(good0[::step, 0], good0[::step, 1],
-               flow_uv[::step, 0], flow_uv[::step, 1],
+               dense_uv[::step, 0], dense_uv[::step, 1],
                color="yellow", scale=200, width=0.003)
-    ax2.set_title("Flow Vectors (u, v)")
+    ax2.set_title("Farneback Flow Vectors (u, v)")
     ax2.axis("off")
 
     # Validation table
@@ -399,8 +429,8 @@ def validate_tracking(video_path, label, out_png, scale=1.0):
     ax3.axis("off")
     col_labels = ["Pt", "x0", "y0",
                   "x1(LK)", "y1(LK)",
-                  "x_pred", "y_pred",
-                  "u", "v",
+                  "x_pred(F)", "y_pred(F)",
+                  "u(F)", "v(F)",
                   "I_bilinear", "I_actual", "Residual"]
     table_data = [
         [str(r[0]),
@@ -422,12 +452,19 @@ def validate_tracking(video_path, label, out_png, scale=1.0):
         tbl[(0, j)].set_facecolor("#2c3e50")
         tbl[(0, j)].set_text_props(color="white", fontweight="bold")
 
+    # Compute summary stats for the title
+    residuals = [r[11] for r in rows]
+    mean_res = np.mean(residuals)
+    max_res = np.max(residuals)
+
     ax3.set_title(
-        "Pixel-Level Validation Table\n"
-        "x0,y0 = feature in frame t | x1,y1 = LK tracked position in frame t+1\n"
-        "x_pred,y_pred = predicted = (x0+u, y0+v) | "
-        "I_bilinear = interpolated intensity at predicted pos | "
-        "I_actual = pixel intensity at rounded (x1,y1) | Residual = ||p_hat - p1||",
+        "Pixel-Level Cross-Validation Table\n"
+        "x0,y0 = feature in frame t | x1,y1 = LK tracked position in t+1 | "
+        "x_pred,y_pred = Farneback predicted = (x0+u_F, y0+v_F)\n"
+        "I_bilinear = interpolated intensity at Farneback predicted pos | "
+        "I_actual = pixel intensity at LK pos | "
+        f"Residual = ||p_hat_F - p_LK||   "
+        f"(mean={mean_res:.4f}, max={max_res:.4f})",
         fontsize=9, pad=8)
 
     plt.tight_layout()
@@ -440,10 +477,12 @@ def validate_tracking(video_path, label, out_png, scale=1.0):
 # SECTION 5 — OPTICAL FLOW INFERENCE  (quantitative analysis)
 # ===========================================================================
 
-def print_flow_analysis(video_path, label, scale=1.0):
+def print_flow_analysis(video_path, label, out_png, scale=1.0):
     """
-    Compute a single dense-flow frame and print quantitative statistics
-    that support the interpretation of what optical flow tells us.
+    Compute a single dense-flow frame and produce:
+      - Console: quantitative statistics
+      - PNG figure with 6 subplots providing numerical/visual evidence
+        for each inference that can be drawn from optical flow.
     """
     cap = cv2.VideoCapture(video_path)
     ret, f0 = cap.read()
@@ -458,25 +497,170 @@ def print_flow_analysis(video_path, label, scale=1.0):
 
     g0 = cv2.cvtColor(f0, cv2.COLOR_BGR2GRAY)
     g1 = cv2.cvtColor(f1, cv2.COLOR_BGR2GRAY)
+    h, w = g0.shape
 
     flow = cv2.calcOpticalFlowFarneback(g0, g1, None,
                                         0.5, 3, 15, 3, 5, 1.2, 0)
     mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+    ang_deg = np.degrees(ang)
 
-    print(f"\n  [{label}] Optical-Flow Analysis (frames 0->1)")
-    print(f"    Mean magnitude   : {mag.mean():.3f} px/frame")
-    print(f"    Max  magnitude   : {mag.max():.3f} px/frame")
-    print(f"    Std  magnitude   : {mag.std():.3f} px/frame")
-    print(f"    Pixels moving    : {(mag > 0.5).mean()*100:.1f}%")
-    dom_angle = np.degrees(ang[mag > 1.0].mean()) if (mag > 1.0).any() else 0
-    print(f"    Dominant direction: {dom_angle:.1f} deg")
-    print()
-    print("  What optical flow tells us:")
-    print("    Magnitude map  -> which regions are moving (foreground vs background)")
-    print("    Direction map  -> direction of object or camera motion")
-    print("    High-mag blobs -> independently moving objects (people, vehicles, ...)")
-    print("    Near-zero mag  -> static background")
-    print("    Global pattern -> camera ego-motion (pan / tilt / zoom)")
+    # --- Derived quantities --------------------------------------------------
+    moving_mask   = mag > 0.5                         # foreground threshold
+    static_mask   = ~moving_mask
+    pct_moving    = moving_mask.mean() * 100
+    pct_static    = static_mask.mean() * 100
+    mean_mag      = mag.mean()
+    max_mag       = mag.max()
+    std_mag       = mag.std()
+
+    # Dominant direction among clearly-moving pixels
+    strong_mask = mag > 1.0
+    if strong_mask.any():
+        dom_angle  = ang_deg[strong_mask].mean()
+        dir_std    = ang_deg[strong_mask].std()
+    else:
+        dom_angle, dir_std = 0.0, 0.0
+
+    # Foreground vs background mean magnitude (object segmentation evidence)
+    fg_mean = mag[moving_mask].mean() if moving_mask.any() else 0
+    bg_mean = mag[static_mask].mean() if static_mask.any() else 0
+
+    # Ego-motion test: if direction std is low -> coherent global motion
+    ego_motion_likely = dir_std < 60
+
+    # Depth / parallax: compare magnitude in top-half vs bottom-half
+    top_mag  = mag[:h//2, :].mean()
+    bot_mag  = mag[h//2:, :].mean()
+
+    # --- Console output ------------------------------------------------------
+    print(f"\n  [{label}] Optical-Flow Quantitative Evidence (frames 0->1)")
+    print(f"    Image size          : {w} x {h}")
+    print(f"    Mean magnitude      : {mean_mag:.3f} px/frame")
+    print(f"    Max  magnitude      : {max_mag:.3f} px/frame")
+    print(f"    Std  magnitude      : {std_mag:.3f} px/frame")
+    print(f"    Foreground (mag>0.5): {pct_moving:.1f}%  mean={fg_mean:.3f} px/frame")
+    print(f"    Background (mag<=0.5): {pct_static:.1f}%  mean={bg_mean:.3f} px/frame")
+    print(f"    Dominant direction  : {dom_angle:.1f} deg  (std={dir_std:.1f} deg)")
+    print(f"    Ego-motion likely   : {'Yes' if ego_motion_likely else 'No'}"
+          f"  (direction std {'<' if ego_motion_likely else '>='} 60 deg)")
+    print(f"    Top-half mean mag   : {top_mag:.3f}   Bottom-half: {bot_mag:.3f}"
+          f"   (parallax ratio: {bot_mag/top_mag:.2f}x)" if top_mag > 0
+          else f"    Top-half mean mag   : {top_mag:.3f}   Bottom-half: {bot_mag:.3f}")
+
+    # --- Figure with 6 evidence panels ---------------------------------------
+    fig, axes = plt.subplots(2, 3, figsize=(22, 13))
+    fig.suptitle(f"Optical Flow Evidence — {label}", fontsize=15, fontweight="bold")
+
+    # (1) Magnitude histogram — object segmentation evidence
+    ax = axes[0, 0]
+    ax.hist(mag.ravel(), bins=100, range=(0, max_mag), color="steelblue",
+            edgecolor="none", alpha=0.8)
+    ax.axvline(0.5, color="red", ls="--", lw=1.5, label=f"threshold = 0.5 px")
+    ax.set_xlabel("Flow Magnitude (px/frame)")
+    ax.set_ylabel("Pixel Count")
+    ax.set_title("1. Object Segmentation\nMagnitude Histogram")
+    ax.legend(fontsize=8)
+    ax.text(0.97, 0.95,
+            f"Static: {pct_static:.1f}% (mean={bg_mean:.3f})\n"
+            f"Moving: {pct_moving:.1f}% (mean={fg_mean:.3f})",
+            transform=ax.transAxes, fontsize=8, va="top", ha="right",
+            bbox=dict(boxstyle="round", fc="white", alpha=0.8))
+
+    # (2) Thresholded magnitude map — foreground / background mask
+    ax = axes[0, 1]
+    seg_vis = np.zeros((h, w, 3), dtype=np.uint8)
+    seg_vis[moving_mask] = [0, 255, 0]     # green  = moving
+    seg_vis[static_mask] = [40, 40, 40]    # dark   = static
+    ax.imshow(seg_vis)
+    ax.set_title("2. Foreground vs Background\nGreen = moving | Dark = static")
+    ax.axis("off")
+    ax.text(0.02, 0.02,
+            f"FG: {pct_moving:.1f}%  BG: {pct_static:.1f}%",
+            transform=ax.transAxes, fontsize=9, color="white",
+            bbox=dict(boxstyle="round", fc="black", alpha=0.6))
+
+    # (3) Direction histogram (polar) — motion direction + ego-motion evidence
+    ax = axes[0, 2]
+    dir_data = ang_deg[strong_mask].ravel() if strong_mask.any() else ang_deg.ravel()
+    ax.hist(dir_data, bins=72, range=(0, 360), color="coral",
+            edgecolor="none", alpha=0.8)
+    ax.axvline(dom_angle, color="navy", ls="--", lw=1.5,
+               label=f"dominant = {dom_angle:.1f}°")
+    ax.set_xlabel("Direction (degrees)")
+    ax.set_ylabel("Pixel Count")
+    ax.set_title("3. Motion Direction & Ego-Motion\nDirection Histogram (moving pixels)")
+    ax.legend(fontsize=8)
+    verdict = "Coherent (ego-motion)" if ego_motion_likely else "Scattered (independent objects)"
+    ax.text(0.97, 0.95,
+            f"Mean dir: {dom_angle:.1f}°\nStd dir: {dir_std:.1f}°\n→ {verdict}",
+            transform=ax.transAxes, fontsize=8, va="top", ha="right",
+            bbox=dict(boxstyle="round", fc="white", alpha=0.8))
+
+    # (4) HSV flow visualisation — velocity + direction evidence
+    ax = axes[1, 0]
+    hsv_img = np.zeros((h, w, 3), dtype=np.uint8)
+    hsv_img[..., 0] = (ang_deg / 2).astype(np.uint8)        # hue  = direction
+    hsv_img[..., 1] = 255                                    # full saturation
+    hsv_img[..., 2] = cv2.normalize(mag, None, 0, 255,
+                                    cv2.NORM_MINMAX).astype(np.uint8)
+    flow_rgb = cv2.cvtColor(hsv_img, cv2.COLOR_HSV2RGB)
+    ax.imshow(flow_rgb)
+    ax.set_title("4. Velocity & Direction Map (HSV)\nBright = fast | Colour = direction")
+    ax.axis("off")
+    ax.text(0.02, 0.02,
+            f"Mean speed: {mean_mag:.2f} px/frame\nMax speed: {max_mag:.2f} px/frame",
+            transform=ax.transAxes, fontsize=9, color="white",
+            bbox=dict(boxstyle="round", fc="black", alpha=0.6))
+
+    # (5) Top-half vs bottom-half magnitude — depth / parallax evidence
+    ax = axes[1, 1]
+    zones = ["Top Half\n(far)", "Bottom Half\n(near)"]
+    vals  = [top_mag, bot_mag]
+    bars  = ax.bar(zones, vals, color=["#3498db", "#e74c3c"], width=0.5)
+    ax.set_ylabel("Mean Flow Magnitude (px/frame)")
+    ax.set_title("5. Depth Cue (Parallax)\nNearer objects flow faster")
+    for bar, v in zip(bars, vals):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                f"{v:.3f}", ha="center", fontsize=10, fontweight="bold")
+    ratio = bot_mag / top_mag if top_mag > 0 else 0
+    ax.text(0.97, 0.95,
+            f"Ratio (bottom/top): {ratio:.2f}x\n"
+            f"{'Bottom faster → near objects move more' if ratio > 1 else 'Top faster or similar → flat scene / camera motion'}",
+            transform=ax.transAxes, fontsize=8, va="top", ha="right",
+            bbox=dict(boxstyle="round", fc="white", alpha=0.8))
+
+    # (6) Summary evidence table
+    ax = axes[1, 2]
+    ax.axis("off")
+    table_data = [
+        ["Object Segmentation",   f"{pct_moving:.1f}% moving, {pct_static:.1f}% static",
+         f"FG mean={fg_mean:.3f}, BG mean={bg_mean:.3f}"],
+        ["Camera Ego-Motion",     f"Dir std = {dir_std:.1f}°",
+         "Yes" if ego_motion_likely else "No — independent motion"],
+        ["Object Velocity",       f"Mean = {mean_mag:.3f} px/fr",
+         f"Max = {max_mag:.3f} px/fr"],
+        ["Motion Direction",      f"Dominant = {dom_angle:.1f}°",
+         f"Spread = {dir_std:.1f}°"],
+        ["Depth / Parallax",      f"Top = {top_mag:.3f}, Bot = {bot_mag:.3f}",
+         f"Ratio = {ratio:.2f}x"],
+        ["Event Detection",       f"Max spike = {max_mag:.3f} px/fr",
+         f"Std = {std_mag:.3f} px/fr"],
+    ]
+    col_labels = ["Inference", "Key Metric", "Evidence"]
+    tbl = ax.table(cellText=table_data, colLabels=col_labels,
+                   loc="center", cellLoc="center")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(9)
+    tbl.scale(1, 2.0)
+    for j in range(len(col_labels)):
+        tbl[(0, j)].set_facecolor("#2c3e50")
+        tbl[(0, j)].set_text_props(color="white", fontweight="bold")
+    ax.set_title("6. Numerical Evidence Summary", fontsize=11, pad=10)
+
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=120, bbox_inches="tight")
+    plt.close()
+    print(f"  Evidence figure saved -> {out_png}")
 
 
 # ===========================================================================
@@ -492,7 +676,10 @@ def main():
         print(f"  Processing {label}  ({vpath})")
         print(f"{'='*60}")
 
-        print_flow_analysis(vpath, label, scale=sc)
+        print_flow_analysis(
+            vpath, label,
+            os.path.join(OUTPUT_DIR, f"flow_analysis_{label}.png"),
+            scale=sc)
 
         print(f"\n  [1/3] Sparse optical flow ...")
         compute_sparse_optical_flow(

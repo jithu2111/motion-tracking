@@ -45,8 +45,10 @@ All results are written to `./output/`:
 | `video2_sparse_optical_flow.mp4` | Lucas-Kanade sparse flow — Video 2 |
 | `video1_dense_optical_flow.mp4`  | Farneback dense HSV flow — Video 1 |
 | `video2_dense_optical_flow.mp4`  | Farneback dense HSV flow — Video 2 |
-| `frame_validation_Video1_720p.png`  | Pixel-level validation table — Video 1 |
-| `frame_validation_Video2_4K.png`    | Pixel-level validation table — Video 2 |
+| `flow_analysis_Video1_720p.png`  | Quantitative evidence figure (6 panels) — Video 1 |
+| `flow_analysis_Video2_4K.png`    | Quantitative evidence figure (6 panels) — Video 2 |
+| `frame_validation_Video1_720p.png`  | LK vs Farneback cross-validation — Video 1 |
+| `frame_validation_Video2_4K.png`    | LK vs Farneback cross-validation — Video 2 |
 
 ---
 
@@ -202,21 +204,33 @@ All four weights are non-negative and sum to 1 — this is a **convex combinatio
 
 ---
 
-### 6. Tracking Validation
+### 6. Tracking Validation (Cross-Validation)
+
+To validate the tracking math, two **independent** optical flow methods are compared:
+
+- **Method A — Lucas-Kanade (sparse):** tracks feature points directly, giving positions `p1_LK`
+- **Method B — Farneback (dense):** computes a full flow field `(u_F, v_F)` at every pixel
+
+The Farneback flow is sampled at each detected feature location `p0` to predict:
+```
+p_hat = p0 + (u_F, v_F)
+```
+
+The **residual** `||p_hat - p1_LK||` measures how closely these two independent methods agree. A small residual confirms that the tracking equations produce consistent results regardless of the solver used.
 
 For each of two consecutive frames from both videos, the program:
 
 1. Detects Shi-Tomasi corners in frame `t`
-2. Runs Lucas-Kanade to compute `(u, v)` per feature
-3. Computes theoretical prediction: `p_hat = (x0+u, y0+v)`
-4. Reads bilinear-interpolated intensity at `p_hat` in frame `t+1`
-5. Reads actual pixel intensity at the nearest integer location `round(p1)`
-6. Reports residual `||p_hat - p1||` (expected ≈ 0 confirming the math)
+2. Runs Lucas-Kanade to get tracked positions `p1_LK` in frame `t+1`
+3. Runs Farneback dense flow independently to get `(u_F, v_F)` at each feature
+4. Computes predicted position: `p_hat = p0 + (u_F, v_F)`
+5. Computes residual: `||p_hat - p1_LK||` (small = methods agree)
+6. Uses bilinear interpolation to read intensity at `p_hat` in frame `t+1` and compares with the actual pixel intensity at `p1_LK`
 
 The validation PNG for each video shows:
 - **Frame t** with detected features
-- **Frame t+1** with LK-tracked (red) vs predicted (yellow ×) positions
-- **Quiver plot** of flow vectors
+- **Frame t+1** with LK-tracked (red) vs Farneback-predicted (yellow ×) positions
+- **Quiver plot** of Farneback flow vectors
 - **Table** of 10 sample points with all coordinates, intensities, and residuals
 
 ---
